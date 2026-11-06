@@ -289,8 +289,8 @@
   // size, so the same code is right for any encode. The result is kept for the page's lifetime.
   function measure(url) {
     var q = CONFIG.quality, ctl = window.AbortController ? new AbortController() : null;
-    var half = q.probeBytes / 2, got = 0, tHalf = 0, tLast = 0, gotHalf = 0, total = 0;
-    var timer = setTimeout(function () { if (ctl) ctl.abort(); }, q.probeTimeoutMs);
+    var half = q.probeBytes / 2, got = 0, tHalf = 0, tLast = 0, gotHalf = 0, total = 0, timedOut = false;
+    var timer = setTimeout(function () { timedOut = true; if (ctl) ctl.abort(); }, q.probeTimeoutMs);
     function result() {
       clearTimeout(timer);
       var ms = tLast - tHalf;
@@ -308,7 +308,7 @@
           return pump();
         });
       })().catch(function () { return result(); });
-    }).catch(function () { clearTimeout(timer); return got ? result() : null; });
+    }).catch(function () { clearTimeout(timer); return got || timedOut ? result() : null; });
   }
   function fitsConnection(cfg) {
     if (!cfg.sources['4k'] || !cfg.duration) return Promise.resolve(true);
@@ -316,7 +316,7 @@
     if (!S.probes[key]) S.probes[key] = measure(absUrl(key)).then(function (r) {
       if (!r) { log('probe: no result, keeping 4k'); return true; }
       var need = r.total ? r.total * 8 / cfg.duration / 1e6 * q.headroom : 0;
-      var fits = !need || r.mbps >= need;     // a timeout before the second half leaves mbps at 0
+      var fits = need ? r.mbps >= need : r.mbps > 0;     // a timeout leaves mbps at 0, with or without a file size
       log('probe: ' + r.mbps.toFixed(1) + ' Mbps, 4k needs ' + need.toFixed(1) + ' -> ' + (fits ? '4k' : 'lower tier'));
       return fits;
     });
@@ -591,7 +591,7 @@
   function open() {
     var sid = S.scene, cfg = sid && CONFIG.scenes[sid];
     if (!cfg || S.open) return;
-    S.open = true; S.closing = false; S.cfg = cfg; S.openScene = sid;
+    S.open = true; S.closing = false; S.cfg = cfg; S.openScene = sid; S.retried = false;
     clearTimeout(preT); preT = 0;
     syncCard();
     var p = psv(), pos = p ? p.getPosition() : { yaw: 0, pitch: 0 };
@@ -613,11 +613,11 @@
   function startVideo(tier) {
     var cfg = S.cfg; if (!cfg.sources[tier]) tier = ORDER.filter(function (t) { return cfg.sources[t]; })[0];
     S.tier = tier;
-    var v;
-    if (pre && pre.scene === S.openScene && pre.tier === tier) { v = pre.v; pre = null; log('using preloaded ' + tier); }
+    var v, preloaded = false;
+    if (pre && pre.scene === S.openScene && pre.tier === tier) { v = pre.v; pre = null; preloaded = true; log('using preloaded ' + tier); }
     else { cancelPreload(); v = makeVideo(absUrl(cfg.sources[tier])); }
     S.vid = v; attachEvents(v); frameLoop(v);
-    var timeout = setTimeout(function () { if (S.vid === v && !S.shown) onVideoError(); }, 25000);
+    var timeout = setTimeout(function () { if (S.vid === v && !S.shown) onVideoError(); }, preloaded ? 10000 : 25000);
     var first = function () {
       if (S.vid !== v || S.shown) return;
       var okFrame = v.readyState >= 2 && v.videoWidth > 0; if (!okFrame) return;
@@ -634,6 +634,10 @@
   function onVideoError() {
     if (!S.open || S.closing) return;
     var cfg = S.cfg, next = lowerTier(S.tier, cfg);
+    if (!S.shown && !S.retried) {
+      S.retried = true; log('no first frame on ' + S.tier + ', retrying with a fresh element');
+      killVideo(S.vid); S.vid = null; startVideo(S.tier); return;
+    }
     if (next && !S.shown) {                                           // try the next tier before giving up
       log('error on ' + S.tier + ', trying ' + next);
       var old = S.vid; try { old.pause(); old.removeAttribute('src'); old.load(); old.remove(); } catch (e) {}
