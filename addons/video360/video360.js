@@ -27,6 +27,7 @@
         yawOffset: 11,        // measured by edge correlation panorama vs video frame (see QA.md)
         pitchOffset: 0,
         pauseAmbient: false,  // NB: the audio track in video1.mp4 is digital silence (-91 dB); played muted anyway
+        duration: 36.84,      // seconds; with the file size it gives the bitrate the 4k tier needs
         sources: {
           '4k': 'video/360/sirio-4k.mp4',
           'mobile': 'video/360/sirio-mobile.mp4'
@@ -37,6 +38,7 @@
         yawOffset: 0,         // video is shot from a different spot than the panorama: no offset can match
         pitchOffset: 0,
         pauseAmbient: false,  // video2.mov has no audio track
+        duration: 16.18,
         sources: {
           '4k': 'video/360/drawer-4k.mp4',
           'mobile': 'video/360/drawer-mobile.mp4'
@@ -53,12 +55,15 @@
       mobileMaxWidth: 860,            // same breakpoint as the tour's own mobile layout
       hevc8kCodec: 'hvc1.1.6.L180.B0',
       width8k: 7680, height8k: 3840, fps: 30, bitrate8k: 53e6,
+      // scene preload + connection probe: see "preload and start tier" below
+      preload: true, probeBytes: 4194304, probeTimeoutMs: 4000, headroom: 1.15,
       // adaptive downgrade (8k -> 4k -> mobile) at the same point of the video
       stallWaitingEvents: 3, stallWindowMs: 10000, stallMs: 3500,
       dropRatio: 0.25, dropMinFrames: 40
     },
     view: {                            // sensitivity, calibrated against the tour's own drag/wheel
-      dragGain: 1.04, wheelGain: 0.05, minFov: 26, maxFov: 96
+      dragGain: 1.04, wheelGain: 0.05, minFov: 26, maxFov: 96,
+      defaultFov: 78.5                 // opening FOV of every video; a scene can override it with `fov`
     },
     cardDelayMs: 1300                  // wait after arriving in a scene before the card shows
   };
@@ -187,7 +192,7 @@
   var S = {
     scene: null, lastCfgScene: null, sceneSince: 0, collapsed: {}, cardOn: false, fabOn: false,
     open: false, closing: false, vid: null, tier: null, ambientWas: false, view0: null, cfg: null,
-    toastT: 0, downgraded: false, returning: false
+    toastT: 0, downgraded: false, returning: false, probes: {}
   };
 
   /* ------------------------------------------------------------------ card / fab */
@@ -234,6 +239,7 @@
       if (S.open) { close('scene', true); }
       applyText();
       if (sid && CONFIG.scenes[sid] && CONFIG.scenes[sid].sources['8k']) prefetchCaps();
+      schedulePreload(sid);
     }
     syncCard();
   }
@@ -266,10 +272,74 @@
     var forced = qs('v360q');                                  // ?v360q=8k|4k|mobile (QA aid)
     if (forced && cfg.sources[forced]) return Promise.resolve(forced);
     if (isMobile() && cfg.sources.mobile) return Promise.resolve('mobile');
-    if (S.downgraded || !cfg.sources['8k']) return Promise.resolve(cfg.sources['4k'] ? '4k' : 'mobile');
+    var top = cfg.sources['4k'] ? '4k' : 'mobile';
+    if (S.downgraded) return Promise.resolve(cfg.sources['8k'] ? top : (cfg.sources.mobile ? 'mobile' : top));   // the visit keeps the lower tier
     var conn = navigator.connection;
-    if ((conn && conn.saveData) || glMaxTexture() < CONFIG.quality.width8k) return Promise.resolve('4k');
-    return prefetchCaps().then(function (c) { return (c.supported && c.smooth) ? '8k' : '4k'; });
+    if (conn && conn.saveData && cfg.sources.mobile) return Promise.resolve('mobile');
+    return fitsConnection(cfg).then(function (fits) {
+      if (!fits && cfg.sources.mobile) return 'mobile';
+      if (!cfg.sources['8k'] || glMaxTexture() < CONFIG.quality.width8k) return top;
+      return prefetchCaps().then(function (c) { return (c.supported && c.smooth) ? '8k' : top; });
+    });
+  }
+
+  /* ------------------------------------------------------------------ preload and start tier */
+  // Times the second half of a ranged download of the 4k file: the first half is TCP slow start, which
+  // would make a fast connection far from the bucket look slow. The bitrate comes from the file's real
+  // size, so the same code is right for any encode. The result is kept for the page's lifetime.
+  function measure(url) {
+    var q = CONFIG.quality, ctl = window.AbortController ? new AbortController() : null;
+    var half = q.probeBytes / 2, got = 0, tHalf = 0, tLast = 0, gotHalf = 0, total = 0;
+    var timer = setTimeout(function () { if (ctl) ctl.abort(); }, q.probeTimeoutMs);
+    function result() {
+      clearTimeout(timer);
+      var ms = tLast - tHalf;
+      return { mbps: tHalf && got > gotHalf ? (got - gotHalf) * 8 / Math.max(ms, 1) / 1000 : 0, total: total, bytes: got };
+    }
+    return fetch(url, { headers: { Range: 'bytes=0-' + (q.probeBytes - 1) }, cache: 'no-store', signal: ctl ? ctl.signal : undefined }).then(function (r) {
+      if (r.status !== 206 || !r.body) { clearTimeout(timer); if (ctl) ctl.abort(); return null; }   // no Range support: nothing to measure
+      var m = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || ''); total = m ? +m[1] : 0;
+      var rd = r.body.getReader();
+      return (function pump() {
+        return rd.read().then(function (c) {
+          if (c.done) return result();
+          got += c.value.length; tLast = performance.now();
+          if (!tHalf && got >= half) { tHalf = tLast; gotHalf = got; }
+          return pump();
+        });
+      })().catch(function () { return result(); });
+    }).catch(function () { clearTimeout(timer); return got ? result() : null; });
+  }
+  function fitsConnection(cfg) {
+    if (!cfg.sources['4k'] || !cfg.duration) return Promise.resolve(true);
+    var key = cfg.sources['4k'], q = CONFIG.quality;
+    if (!S.probes[key]) S.probes[key] = measure(absUrl(key)).then(function (r) {
+      if (!r) { log('probe: no result, keeping 4k'); return true; }
+      var need = r.total ? r.total * 8 / cfg.duration / 1e6 * q.headroom : 0;
+      var fits = !need || r.mbps >= need;     // a timeout before the second half leaves mbps at 0
+      log('probe: ' + r.mbps.toFixed(1) + ' Mbps, 4k needs ' + need.toFixed(1) + ' -> ' + (fits ? '4k' : 'lower tier'));
+      return fits;
+    });
+    return S.probes[key];
+  }
+  var pre = null, preT = 0;
+  function killVideo(v) { try { v.pause(); v.removeAttribute('src'); v.load(); v.remove(); } catch (e) {} }
+  function cancelPreload() { clearTimeout(preT); preT = 0; if (pre) { killVideo(pre.v); pre = null; } }
+  // only the scene that has the video, after the same pause the card waits, never on a phone or with Save-Data
+  function schedulePreload(sid) {
+    cancelPreload();
+    var cfg = sid && CONFIG.scenes[sid], conn = navigator.connection;
+    if (!cfg || !CONFIG.quality.preload || isMobile() || (conn && conn.saveData)) return;
+    preT = setTimeout(function () {
+      if (S.scene !== sid || S.open) return;
+      pickTier(cfg).then(function (tier) {
+        if (S.scene !== sid || S.open || pre) return;
+        var v = makeVideo(absUrl(cfg.sources[tier]));
+        pre = { scene: sid, tier: tier, v: v };
+        v.addEventListener('error', function () { if (pre && pre.v === v) { killVideo(v); pre = null; } }, { once: true });
+        log('preload ' + tier);
+      });
+    }, CONFIG.cardDelayMs);
   }
   function lowerTier(t, cfg) {
     for (var i = ORDER.indexOf(t) + 1; i < ORDER.length; i++) if (cfg.sources[ORDER[i]]) return ORDER[i];
@@ -522,13 +592,14 @@
     var sid = S.scene, cfg = sid && CONFIG.scenes[sid];
     if (!cfg || S.open) return;
     S.open = true; S.closing = false; S.cfg = cfg; S.openScene = sid;
+    clearTimeout(preT); preT = 0;
     syncCard();
     var p = psv(), pos = p ? p.getPosition() : { yaw: 0, pitch: 0 };
     var zl = p && p.getZoomLevel ? p.getZoomLevel() : 50;
     S.view0 = { yaw: pos.yaw, pitch: pos.pitch, zoom: zl };
     cam.yaw = pos.yaw + (cfg.yawOffset || 0) * D2R;
     cam.pitch = clamp(pos.pitch + (cfg.pitchOffset || 0) * D2R, -Math.PI / 2, Math.PI / 2);
-    cam.fov = cam.fovT = zoomToFov(zl); cam.vy = cam.vp = 0;
+    cam.fov = cam.fovT = cfg.fov || CONFIG.view.defaultFov; cam.vy = cam.vp = 0;
     S.focusBefore = document.activeElement;
     if (cfg.pauseAmbient) ambientPause();
     document.documentElement.classList.add('v360-open');            // only the panorama's hotspot markers are parked
@@ -542,7 +613,10 @@
   function startVideo(tier) {
     var cfg = S.cfg; if (!cfg.sources[tier]) tier = ORDER.filter(function (t) { return cfg.sources[t]; })[0];
     S.tier = tier;
-    var v = makeVideo(absUrl(cfg.sources[tier])); S.vid = v; attachEvents(v); frameLoop(v);
+    var v;
+    if (pre && pre.scene === S.openScene && pre.tier === tier) { v = pre.v; pre = null; log('using preloaded ' + tier); }
+    else { cancelPreload(); v = makeVideo(absUrl(cfg.sources[tier])); }
+    S.vid = v; attachEvents(v); frameLoop(v);
     var timeout = setTimeout(function () { if (S.vid === v && !S.shown) onVideoError(); }, 25000);
     var first = function () {
       if (S.vid !== v || S.shown) return;
@@ -588,7 +662,7 @@
         var yaw = cam.yaw - (cfg.yawOffset || 0) * D2R, pitch = clamp(cam.pitch - (cfg.pitchOffset || 0) * D2R, -Math.PI / 2, Math.PI / 2);
         if (p.stopAll) p.stopAll();
         p.rotate({ yaw: yaw, pitch: pitch });
-        if (p.zoom) p.zoom(fovToZoom(cam.fov));
+        if (p.zoom) p.zoom(S.view0.zoom);                                // the video's FOV never changes the panorama's
       } catch (e) { log('write-back failed: ' + e); }
     }
     var html = document.documentElement;
@@ -608,6 +682,7 @@
       S.open = false; S.closing = false; S.shown = false; S.returning = false; S.tier = null; S.vid = null;
       syncCard();
       if (reason !== 'scene' && S.fabOn) { try { fab.focus({ preventScroll: true }); } catch (e) {} }
+      if (reason !== 'scene') schedulePreload(S.scene);            // a second watch starts as fast as the first
     };
     var wait = reduced() ? 20 : 450;
     setTimeout(finish, wait);
@@ -645,6 +720,7 @@
         canvas: R ? { w: R.w, h: R.h, texW: R.texW, texH: R.texH, webgl2: R.webgl2 } : null, maxTex: maxTex, log: LOG.slice() };
     },
     caps: function () { return prefetchCaps(); },
+    get preload() { return pre ? { scene: pre.scene, tier: pre.tier, readyState: pre.v.readyState, buffered: pre.v.buffered.length ? pre.v.buffered.end(pre.v.buffered.length - 1) : 0 } : null; },
     setCam: function (yawDeg, pitchDeg, fovDeg) { cam.yaw = yawDeg * D2R; cam.pitch = pitchDeg * D2R; if (fovDeg) cam.fov = cam.fovT = fovDeg; dirty = true; kick(); },
     forceDowngrade: function () { downgrade('forced'); }
   };
