@@ -16,6 +16,11 @@
    *                             'mobile' = H.264 2560x1280. Any tier can be omitted.
    *   yawOffset / pitchOffset   degrees. video yaw = panorama yaw + yawOffset. Use it when the video's
    *                             "north" is not the panorama's. Same offset is removed on the way back.
+   *   startYaw / startPitch     optional, degrees, in the VIDEO's own frame (0,0 = the middle of the equirect frame;
+   *                             +yaw turns right, +pitch looks up). When set, the video always OPENS looking there,
+   *                             whatever the panorama was facing, instead of inheriting the panorama's direction.
+   *                             Each one is independent: leave it out to keep inheriting that axis (yawOffset applies
+   *                             only to the inherited case). Closing still hands the camera back to the panorama.
    *   pauseAmbient              true = pause the tour's ambient sound while this video is open (default false:
    *                             the ambient button stays truthful). Videos always play muted, in a loop.
    *   text                      optional per-scene overrides: { en: {...}, it: {...} }
@@ -26,6 +31,7 @@
         poster: 'video/360/sirio-poster.jpg',
         yawOffset: 11,        // measured by edge correlation panorama vs video frame (see QA.md)
         pitchOffset: 0,
+        startYaw: -6, startPitch: -12, // opens centred on the orange KUKA arm, wherever the panorama faced
         pauseAmbient: false,  // NB: the audio track in video1.mp4 is digital silence (-91 dB); played muted anyway
         duration: 36.84,      // seconds; with the file size it gives the bitrate the 4k tier needs
         sources: {
@@ -138,7 +144,7 @@
   }
 
   /* ------------------------------------------------------------------ DOM */
-  var root, stage, canvas, card, thumb, head, title, btnWatch, btnLater, fab, back, loading, loadingTxt, loadingPct, toast;
+  var root, stage, canvas, card, poster, watchLabel, side, head, title, btnWatch, btnLater, fab, back, loading, loadingTxt, loadingPct, toast;
   function build() {
     root = el('div', 'v360-root');
     stage = el('div', 'v360-stage'); stage.tabIndex = -1;
@@ -146,15 +152,20 @@
 
     card = el('section', 'v360-card v360-glass');
     card.setAttribute('role', 'region');
-    thumb = el('div', 'v360-thumb', ico(ICON.play));
-    head = el('div', 'v360-head');                                  // blue dot + title on one line, centred against the thumbnail
+    // Watch is the primary action and carries the preview: poster + scrim (contrast) + play disc + label, all inside ONE button.
+    btnWatch = el('button', 'v360-watch'); btnWatch.type = 'button';
+    poster = el('img', 'v360-poster'); poster.alt = ''; poster.decoding = 'async'; poster.draggable = false; poster.setAttribute('aria-hidden', 'true');
+    var scrim = el('span', 'v360-scrim'); scrim.setAttribute('aria-hidden', 'true');
+    var face = el('span', 'v360-face', '<span class="v360-play" aria-hidden="true">' + ico(ICON.play) + '</span>');
+    watchLabel = el('span', 'v360-watch-label'); face.appendChild(watchLabel);
+    btnWatch.appendChild(poster); btnWatch.appendChild(scrim); btnWatch.appendChild(face);
+    side = el('div', 'v360-side');
+    head = el('div', 'v360-head');                                  // blue dot + title on one line
     title = el('p', 'v360-title');
     head.appendChild(el('i', 'v360-dot')); head.appendChild(title);
-    var act = el('div', 'v360-actions');
-    btnWatch = el('button', 'v360-btn v360-btn--go'); btnWatch.type = 'button';
-    btnLater = el('button', 'v360-btn v360-btn--ghost'); btnLater.type = 'button';
-    act.appendChild(btnWatch); act.appendChild(btnLater);
-    card.appendChild(thumb); card.appendChild(head); card.appendChild(act);
+    btnLater = el('button', 'v360-later'); btnLater.type = 'button';
+    side.appendChild(head); side.appendChild(btnLater);
+    card.appendChild(btnWatch); card.appendChild(side);
 
     fab = el('button', 'v360-fab v360-glass', ico(ICON.cam)); fab.type = 'button';
     fab.setAttribute('aria-expanded', 'false');
@@ -182,7 +193,8 @@
     var sid = S.scene && CONFIG.scenes[S.scene] ? S.scene : S.lastCfgScene;
     card.setAttribute('aria-label', T('region', sid));
     title.textContent = T('title', sid);
-    btnWatch.innerHTML = ico(ICON.play) + '<span>' + T('watch', sid) + '</span>';
+    watchLabel.textContent = T('watch', sid);
+    btnWatch.setAttribute('aria-label', T('title', sid));            // contains the visible word ("Watch"/"Guarda"); the poster is decorative
     btnLater.textContent = T('later', sid);
     fab.setAttribute('aria-label', T('title', sid)); fab.title = T('title', sid);
     back.innerHTML = ico(ICON.back) + '<span>' + T('back', sid) + '</span><span class="v360-esc mono" aria-hidden="true">ESC</span>';
@@ -208,27 +220,14 @@
     if (!root) return;
     var cfg = S.scene && CONFIG.scenes[S.scene];
     var eligible = !!cfg && !S.open && !S.returning && !gateOpen() && !panelOpen() && (Date.now() - S.sceneSince) >= CONFIG.cardDelayMs;
-    updateLift();
     var wantCard = eligible && !S.collapsed[S.scene];
     var wantFab = eligible && !!S.collapsed[S.scene];
     if (cfg) {
-      thumb.style.backgroundImage = 'url("' + cfg.poster + '")';
+      if (poster.getAttribute('data-poster') !== cfg.poster) { poster.setAttribute('data-poster', cfg.poster); poster.src = cfg.poster; }
       S.lastCfgScene = S.scene;
     }
-    if (wantCard !== S.cardOn) { S.cardOn = wantCard; card.classList.toggle('is-on', wantCard); card.setAttribute('aria-hidden', wantCard ? 'false' : 'true'); setInert(card, !wantCard); }
+    if (wantCard !== S.cardOn) { S.cardOn = wantCard; document.documentElement.classList.toggle('v360-card-on', wantCard); card.classList.toggle('is-on', wantCard); card.setAttribute('aria-hidden', wantCard ? 'false' : 'true'); setInert(card, !wantCard); }
     if (wantFab !== S.fabOn) { S.fabOn = wantFab; fab.classList.toggle('is-on', wantFab); fab.setAttribute('aria-expanded', 'false'); fab.setAttribute('aria-hidden', wantFab ? 'false' : 'true'); setInert(fab, !wantFab); }
-  }
-  // phones: the tour opens its "About this floor" card in the same slot above the bottom bar; stack ours on top of it
-  function updateLift() {
-    var lift = 0;
-    if (window.matchMedia && matchMedia("(max-width:" + CONFIG.quality.mobileMaxWidth + "px) and (min-height:521px)").matches) {
-      var fc = $("floorcard");
-      if (fc && fc.classList.contains("on")) {
-        var r = fc.getBoundingClientRect(), bar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--bar")) || 78;
-        lift = Math.max(0, Math.round(window.innerHeight - r.top + 8 - (bar + 10)));
-      }
-    }
-    if (S.lift !== lift) { S.lift = lift; root.style.setProperty("--v360-lift", lift + "px"); }
   }
   function setInert(node, on) { if ('inert' in node) node.inert = on; else node.tabIndex = on ? -1 : 0; }
 
@@ -699,8 +698,9 @@
     var p = psv(), pos = p ? p.getPosition() : { yaw: 0, pitch: 0 };
     var zl = p && p.getZoomLevel ? p.getZoomLevel() : 50;
     S.view0 = { yaw: pos.yaw, pitch: pos.pitch, zoom: zl };
-    cam.yaw = pos.yaw + (cfg.yawOffset || 0) * D2R;
-    cam.pitch = clamp(pos.pitch + (cfg.pitchOffset || 0) * D2R, -Math.PI / 2, Math.PI / 2);
+    // a scene with startYaw/startPitch always opens on that view of the video; otherwise it inherits the panorama's direction
+    cam.yaw = typeof cfg.startYaw === 'number' ? cfg.startYaw * D2R : pos.yaw + (cfg.yawOffset || 0) * D2R;
+    cam.pitch = clamp(typeof cfg.startPitch === 'number' ? cfg.startPitch * D2R : pos.pitch + (cfg.pitchOffset || 0) * D2R, -Math.PI / 2, Math.PI / 2);
     cam.fov = cam.fovT = cfg.fov || CONFIG.view.defaultFov; cam.vy = cam.vp = 0;
     S.focusBefore = document.activeElement;
     if (cfg.pauseAmbient) ambientPause();
