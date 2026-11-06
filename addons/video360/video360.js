@@ -44,6 +44,7 @@
         yawOffset: 0,         // video is shot from a different spot than the panorama: no offset can match
         pitchOffset: 0,
         pauseAmbient: false,  // video2.mov has no audio track
+        startYaw: 186.74, startPitch: -7.51, fov: 68, // opens on the blue robot; view set by Edd on 2026-11-06
         duration: 16.18,
         sources: {
           '4k': 'video/360/drawer-4k.mp4',
