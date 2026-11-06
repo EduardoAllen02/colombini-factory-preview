@@ -57,6 +57,7 @@
       width8k: 7680, height8k: 3840, fps: 30, bitrate8k: 53e6,
       // scene preload + connection probe: see "preload and start tier" below
       preload: true, probeBytes: 4194304, probeTimeoutMs: 4000, headroom: 1.15,
+      holdSeconds: 8, holdMaxMs: 20000,   // a stall on the lowest tier pauses until this much is buffered
       // adaptive downgrade (8k -> 4k -> mobile) at the same point of the video
       stallWaitingEvents: 3, stallWindowMs: 10000, stallMs: 3500,
       dropRatio: 0.25, dropMinFrames: 40
@@ -137,7 +138,7 @@
   }
 
   /* ------------------------------------------------------------------ DOM */
-  var root, stage, canvas, card, thumb, head, title, btnWatch, btnLater, fab, back, loading, loadingTxt, toast;
+  var root, stage, canvas, card, thumb, head, title, btnWatch, btnLater, fab, back, loading, loadingTxt, loadingPct, toast;
   function build() {
     root = el('div', 'v360-root');
     stage = el('div', 'v360-stage'); stage.tabIndex = -1;
@@ -162,6 +163,7 @@
 
     loading = el('div', 'v360-loading v360-glass'); loading.setAttribute('role', 'status'); loading.setAttribute('aria-live', 'polite');
     loading.appendChild(el('div', 'v360-ring')); loadingTxt = el('div', 'mono'); loading.appendChild(loadingTxt);
+    loadingPct = el('div', 'mono v360-pct'); loadingPct.setAttribute('aria-hidden', 'true'); loading.appendChild(loadingPct);
     toast = el('div', 'v360-toast v360-glass'); toast.setAttribute('role', 'alert');
 
     [stage, card, fab, back, loading, toast].forEach(function (n) { root.appendChild(n); });
@@ -192,7 +194,7 @@
   var S = {
     scene: null, lastCfgScene: null, sceneSince: 0, collapsed: {}, cardOn: false, fabOn: false,
     open: false, closing: false, vid: null, tier: null, ambientWas: false, view0: null, cfg: null,
-    toastT: 0, downgraded: false, returning: false, probes: {}
+    toastT: 0, downgraded: false, returning: false, probes: {}, mbps: {}, sizes: {}, openId: 0
   };
 
   /* ------------------------------------------------------------------ card / fab */
@@ -314,6 +316,7 @@
     if (!cfg.sources['4k'] || !cfg.duration) return Promise.resolve(true);
     var key = cfg.sources['4k'], q = CONFIG.quality;
     if (!S.probes[key]) S.probes[key] = measure(absUrl(key)).then(function (r) {
+      S.mbps[key] = r ? r.mbps : null;
       if (!r) { log('probe: no result, keeping 4k'); return true; }
       var need = r.total ? r.total * 8 / cfg.duration / 1e6 * q.headroom : 0;
       var fits = need ? r.mbps >= need : r.mbps > 0;     // a timeout leaves mbps at 0, with or without a file size
@@ -322,9 +325,77 @@
     });
     return S.probes[key];
   }
+  // Streaming only works when the connection outruns the file. When it does not, the whole file is
+  // downloaded first and played from memory: a longer wait, then no stalls at all, loop included.
+  // Downloads survive leaving the scene and continue from the same byte on the way back.
+  var dl = {};
+  function dlFor(url) { return dl[url] || (dl[url] = { url: url, chunks: [], got: 0, total: 0, done: false, blobUrl: null, ctl: null, running: false, fails: 0, waiters: [] }); }
+  function dlNotify(d) { if (d.onProgress) d.onProgress(d.total ? d.got / d.total : 0); }
+  function dlFinish(d, err) {
+    var w = d.waiters; d.waiters = []; d.running = false;
+    w.forEach(function (x) { err ? x.reject(err) : x.resolve(d.blobUrl); });
+  }
+  function dlStart(d) {
+    if (d.done || d.running) return;
+    d.running = true; d.ctl = new AbortController();
+    var ctl = d.ctl;
+    fetch(d.url, { headers: d.got ? { Range: 'bytes=' + d.got + '-' } : {}, signal: ctl.signal }).then(function (r) {
+      if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+      if (d.got && r.status !== 206) { d.chunks = []; d.got = 0; }      // the server ignored the Range: start over
+      var cr = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
+      d.total = cr ? +cr[1] : (+r.headers.get('content-length') || d.total);
+      var rd = r.body.getReader();
+      return (function pump() {
+        return rd.read().then(function (c) {
+          if (c.done) return;
+          d.chunks.push(c.value); d.got += c.value.length; d.fails = 0; dlNotify(d);
+          return pump();
+        });
+      })();
+    }).then(function () {
+      d.blobUrl = URL.createObjectURL(new Blob(d.chunks, { type: 'video/mp4' }));
+      d.chunks = []; d.done = true; d.total = d.got;
+      log('downloaded ' + Math.round(d.got / 1e6) + ' MB');
+      dlFinish(d);
+    }).catch(function (e) {
+      d.running = false;
+      if (ctl.signal.aborted) return;                                    // stopped on purpose: the bytes stay for later
+      if (++d.fails > 4) return dlFinish(d, e);
+      setTimeout(function () { if (d.waiters.length || d.wanted) dlStart(d); }, 1000);
+    });
+  }
+  function dlStop(d) { d.wanted = false; if (d.running && d.ctl) d.ctl.abort(); }
+  function dlStopAll() { Object.keys(dl).forEach(function (k) { dlStop(dl[k]); }); }
+  function dlWhenDone(d) {
+    if (d.done) return Promise.resolve(d.blobUrl);
+    return new Promise(function (resolve, reject) { d.waiters.push({ resolve: resolve, reject: reject }); d.wanted = true; dlStart(d); });
+  }
+  function sizeOf(url) {
+    if (S.sizes[url] !== undefined) return Promise.resolve(S.sizes[url]);
+    return fetch(url, { headers: { Range: 'bytes=0-0' } }).then(function (r) {
+      var m = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
+      return (S.sizes[url] = m ? +m[1] : 0);
+    }).catch(function () { return 0; });
+  }
+  function delivery(cfg, tier) {
+    var forced = qs('v360mode'), url = absUrl(cfg.sources[tier]), key = cfg.sources['4k'];
+    if (forced === 'stream' || forced === 'full') return Promise.resolve(forced);
+    if (dl[url] && dl[url].done) return Promise.resolve('full');
+    if (!cfg.duration || !key) return Promise.resolve('stream');
+    return fitsConnection(cfg).then(function (fits) {
+      if (tier === '4k' && fits) return 'stream';
+      var mbps = S.mbps[key];
+      if (mbps === null || mbps === undefined) return 'stream';
+      return sizeOf(url).then(function (total) {
+        var need = total * 8 / cfg.duration / 1e6 * CONFIG.quality.headroom, mode = total && mbps < need ? 'full' : 'stream';
+        log(tier + ' needs ' + need.toFixed(1) + ' Mbps, have ' + mbps.toFixed(1) + ' -> ' + mode);
+        return mode;
+      });
+    });
+  }
   var pre = null, preT = 0;
   function killVideo(v) { try { v.pause(); v.removeAttribute('src'); v.load(); v.remove(); } catch (e) {} }
-  function cancelPreload() { clearTimeout(preT); preT = 0; if (pre) { killVideo(pre.v); pre = null; } }
+  function cancelPreload() { clearTimeout(preT); preT = 0; dlStopAll(); if (pre) { if (pre.v) killVideo(pre.v); pre = null; } }
   // only the scene that has the video, after the same pause the card waits, never on a phone or with Save-Data
   function schedulePreload(sid) {
     cancelPreload();
@@ -333,7 +404,15 @@
     preT = setTimeout(function () {
       if (S.scene !== sid || S.open) return;
       pickTier(cfg).then(function (tier) {
+        return delivery(cfg, tier).then(function (mode) { return { tier: tier, mode: mode }; });
+      }).then(function (c) {
+        var tier = c.tier;
         if (S.scene !== sid || S.open || pre) return;
+        if (c.mode === 'full') {
+          var d = dlFor(absUrl(cfg.sources[tier])); d.wanted = true; dlStart(d);
+          pre = { scene: sid, tier: tier, d: d }; log('downloading ' + tier + ' in the background');
+          return;
+        }
         var v = makeVideo(absUrl(cfg.sources[tier]));
         pre = { scene: sid, tier: tier, v: v };
         v.addEventListener('error', function () { if (pre && pre.v === v) { killVideo(v); pre = null; } }, { once: true });
@@ -521,10 +600,32 @@
       if (S.vid !== v || mon.swapping) return;
       var now = performance.now(); if (v.seeking || now - mon.since < 2500) return;
       mon.waits.push(now); mon.waits = mon.waits.filter(function (t) { return now - t < CONFIG.quality.stallWindowMs; });
-      setTimeout(function () { if (S.vid === v && v.readyState < 3 && !v.paused) loading.classList.add('is-on'); }, 450);
+      if (v.currentSrc.indexOf('blob:') === 0) return;                   // already in memory: a start-up blip, not a stall
+      if (!lowerTier(S.tier, S.cfg)) return hold(v);                     // nothing lower to fall to: build a real buffer
+      setTimeout(function () { if (S.vid === v && v.readyState < 3 && !v.paused) loading.classList.add('is-on'); }, 1500);
       if (mon.waits.length >= CONFIG.quality.stallWaitingEvents) downgrade('waiting');
     });
-    v.addEventListener('canplay', function () { if (S.vid === v) loading.classList.remove('is-on'); });
+    v.addEventListener('canplay', function () { if (S.vid === v && !mon.hold) loading.classList.remove('is-on'); });
+  }
+  function bufferedAhead(v) {
+    for (var i = 0, b = v.buffered; i < b.length; i++) if (b.start(i) <= v.currentTime + 0.1 && b.end(i) >= v.currentTime) return b.end(i) - v.currentTime;
+    return 0;
+  }
+  // pause once, with one steady indicator, instead of playing two frames and stalling again
+  function hold(v) {
+    if (mon.hold) return;
+    mon.hold = true; v.pause(); loading.classList.add('is-on');
+    var q = CONFIG.quality, t0 = performance.now();
+    log('holding to buffer at ' + v.currentTime.toFixed(1) + 's');
+    var timer = setInterval(function () {
+      if (S.vid !== v) { clearInterval(timer); mon.hold = false; return; }
+      var left = (v.duration || 0) - v.currentTime, want = Math.min(q.holdSeconds, left > 0.5 ? left : q.holdSeconds);
+      setProgress(Math.min(0.99, bufferedAhead(v) / want));
+      if (bufferedAhead(v) < want && performance.now() - t0 < q.holdMaxMs) return;
+      clearInterval(timer); mon.hold = false; setProgress(null); loading.classList.remove('is-on');
+      mon.since = performance.now(); mon.waits = []; mon.stallAt = 0;
+      v.play().catch(function () {});
+    }, 250);
   }
   function startMonitor() {
     stopMonitor(); mon.waits = []; mon.badRuns = 0; mon.since = performance.now(); mon.lastTotal = mon.lastDropped = 0; mon.stallAt = 0; mon.tick = 0;
@@ -533,6 +634,7 @@
       var now = performance.now();
       // 1) one long starvation (the browser may report a single "waiting" for the whole thing)
       if (!v.paused && !v.seeking && v.readyState < 3 && now - mon.since > 2500) {
+        if (!lowerTier(S.tier, S.cfg)) return hold(v);
         if (!mon.stallAt) mon.stallAt = now;
         if (now - mon.stallAt >= CONFIG.quality.stallMs) { downgrade("stalled " + Math.round((now - mon.stallAt) / 1000) + "s"); return; }
       } else mon.stallAt = 0;
@@ -610,12 +712,31 @@
     pickTier(cfg).then(function (tier) { if (!S.open || S.closing) return; startVideo(tier); });
   }
 
+  function setProgress(f) { loadingPct.textContent = f === null ? '' : Math.floor(f * 100) + '%'; }
   function startVideo(tier) {
     var cfg = S.cfg; if (!cfg.sources[tier]) tier = ORDER.filter(function (t) { return cfg.sources[t]; })[0];
     S.tier = tier;
-    var v, preloaded = false;
-    if (pre && pre.scene === S.openScene && pre.tier === tier) { v = pre.v; pre = null; preloaded = true; log('using preloaded ' + tier); }
-    else { cancelPreload(); v = makeVideo(absUrl(cfg.sources[tier])); }
+    var id = ++S.openId, live = function () { return S.open && !S.closing && S.openId === id; };
+    delivery(cfg, tier).then(function (mode) {
+      if (!live()) return;
+      if (mode !== 'full') return playElement(tier);
+      var d = dlFor(absUrl(cfg.sources[tier]));
+      if (d.done) return playElement(tier, d.blobUrl);
+      d.onProgress = setProgress; setProgress(d.total ? d.got / d.total : 0);
+      loading.classList.add('is-on');
+      dlWhenDone(d).then(function (url) {
+        d.onProgress = null; setProgress(null);
+        if (live()) playElement(tier, url);
+      }, function (e) {
+        d.onProgress = null; setProgress(null); log('download failed, streaming instead: ' + e);
+        if (live()) playElement(tier);
+      });
+    });
+  }
+  function playElement(tier, blobUrl) {
+    var cfg = S.cfg, v, preloaded = false;
+    if (!blobUrl && pre && pre.v && pre.scene === S.openScene && pre.tier === tier) { v = pre.v; pre = null; preloaded = true; log('using preloaded ' + tier); }
+    else { cancelPreload(); v = makeVideo(blobUrl || absUrl(cfg.sources[tier])); }
     S.vid = v; attachEvents(v); frameLoop(v);
     var timeout = setTimeout(function () { if (S.vid === v && !S.shown) onVideoError(); }, preloaded ? 10000 : 25000);
     var first = function () {
@@ -671,7 +792,7 @@
     }
     var html = document.documentElement;
     S.returning = true;
-    stage.classList.remove('is-on'); back.classList.remove('is-on'); loading.classList.remove('is-on');
+    stage.classList.remove('is-on'); back.classList.remove('is-on'); loading.classList.remove('is-on'); setProgress(null);
     ambientResume();
     if (reason !== 'scene') S.collapsed[S.openScene] = true;           // the visitor has been through it: leave the compact button
     var vid = S.vid;
@@ -724,7 +845,7 @@
         canvas: R ? { w: R.w, h: R.h, texW: R.texW, texH: R.texH, webgl2: R.webgl2 } : null, maxTex: maxTex, log: LOG.slice() };
     },
     caps: function () { return prefetchCaps(); },
-    get preload() { return pre ? { scene: pre.scene, tier: pre.tier, readyState: pre.v.readyState, buffered: pre.v.buffered.length ? pre.v.buffered.end(pre.v.buffered.length - 1) : 0 } : null; },
+    get preload() { return !pre ? null : pre.d ? { scene: pre.scene, tier: pre.tier, full: true, got: pre.d.got, total: pre.d.total, done: pre.d.done } : { scene: pre.scene, tier: pre.tier, readyState: pre.v.readyState, buffered: pre.v.buffered.length ? pre.v.buffered.end(pre.v.buffered.length - 1) : 0 }; },
     setCam: function (yawDeg, pitchDeg, fovDeg) { cam.yaw = yawDeg * D2R; cam.pitch = pitchDeg * D2R; if (fovDeg) cam.fov = cam.fovT = fovDeg; dirty = true; kick(); },
     forceDowngrade: function () { downgrade('forced'); }
   };

@@ -119,6 +119,8 @@ html.v360-open #pins { opacity: 0 !important; visibility: hidden !important; poi
 }
 .v360-loading.is-on { opacity: 1; visibility: visible; transition: opacity .3s var(--ease, ease) .12s, visibility 0s; }
 .v360-ring { width: 30px; height: 30px; border-radius: 50%; border: 2.5px solid rgba(255, 255, 255, .2); border-top-color: var(--v360-accent); animation: v360-spin .8s linear infinite; }
+.v360-pct:empty { display: none; }
+.v360-pct { font-size: 13px; font-variant-numeric: tabular-nums; }
 @keyframes v360-spin { to { transform: rotate(360deg); } }
 
 .v360-toast {
