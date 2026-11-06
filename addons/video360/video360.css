@@ -1,0 +1,166 @@
+/* video360 addon — floating card, 360° video stage and controls.
+   Uses the tour's own tokens (player.css :root): --glass, --line, --txt*, --r*, --shadow,
+   --glass-edge, --mono, --ease, --spring, --gut, --map (#4c8dff accent).
+   Everything is namespaced `v360-`. Nothing here depends on the player's ?edit mode. */
+
+:root {
+  --v360-accent: var(--map, #4c8dff);
+  --v360-top: calc(var(--gut, 22px) + 42px + 12px);   /* just under the tools pill */
+  --v360-fade: 500ms;
+}
+
+/* ---------- stage (WebGL canvas) ---------- */
+.v360-stage {
+  position: fixed; inset: 0; z-index: 1;       /* above #stage (auto), below #vignette (2) and the HUD (20) */
+  background: var(--ink, #0e1728);
+  opacity: 0; pointer-events: none;
+  transition: opacity .45s var(--ease, ease);
+  touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+.v360-stage.is-on { opacity: 1; pointer-events: auto; }
+.v360-stage.is-drag { cursor: grabbing; }
+.v360-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: 0; }
+
+/* ---------- while a video is open only the panorama's hotspot markers are parked (they track the panorama
+   camera, which does not move under the video). Every other piece of the tour UI stays exactly as it is. */
+html.v360-open #pins { opacity: 0 !important; visibility: hidden !important; pointer-events: none !important; }
+
+/* ---------- shared glass surface (same recipe as .pill / #floorcard) ---------- */
+.v360-glass {
+  background: var(--glass, rgba(20, 37, 68, .5));
+  -webkit-backdrop-filter: blur(24px) saturate(1.7);
+  backdrop-filter: blur(24px) saturate(1.7);
+  border: 1px solid var(--line, rgba(255, 255, 255, .15));
+  box-shadow: var(--shadow, 0 16px 44px -14px rgba(6, 12, 24, .6)), var(--glass-edge, inset 0 1px 0 rgba(255, 255, 255, .09));
+}
+
+.v360-root, .v360-root * { box-sizing: border-box; }
+:where(.v360-root) button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+:where(.v360-root) :focus { outline: none; }
+.v360-root :focus-visible, .v360-stage:focus-visible { outline: 2px solid var(--v360-accent); outline-offset: 2px; }
+.v360-ico { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ---------- floating card ---------- */
+.v360-card {
+  position: fixed; z-index: 21;
+  top: var(--v360-top); right: var(--gut, 22px);
+  width: min(308px, calc(100vw - var(--gut, 22px) * 2));
+  padding: 12px;
+  border-radius: var(--r-lg, 5px);
+  color: var(--txt, #f6f8fb);
+  font-family: InterVar, Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px 12px; align-items: center;
+  transform-origin: top right;
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transform: translateY(-6px) scale(.97);
+  transition: opacity var(--v360-fade) var(--ease, ease), transform var(--v360-fade) var(--ease, ease), visibility 0s linear var(--v360-fade);
+}
+.v360-card.is-on {
+  opacity: 1; visibility: visible; pointer-events: auto; transform: none;
+  transition: opacity .5s var(--ease, ease), transform .6s var(--spring, ease), visibility 0s;
+}
+.v360-thumb {
+  position: relative; width: 84px; height: 56px; border-radius: var(--r-sm, 3px); overflow: hidden;
+  background: #0d1a30 center / cover no-repeat; box-shadow: 0 2px 8px #060c188c;
+}
+.v360-thumb:after { content: ""; position: absolute; inset: 0; border: 1px solid rgba(255, 255, 255, .28); border-radius: var(--r-sm, 3px); }
+.v360-thumb .v360-ico { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; color: #fff; filter: drop-shadow(0 1px 4px rgba(0, 0, 0, .55)); }
+.v360-head { min-width: 0; display: flex; align-items: flex-start; gap: 9px; }
+.v360-dot { flex: none; width: 7px; height: 7px; margin-top: 6px; border-radius: 50%; background: var(--v360-accent); box-shadow: 0 0 0 3px rgba(76, 141, 255, .22); }
+.v360-title { min-width: 0; margin: 0; font-size: 14.5px; line-height: 1.28; font-weight: 600; letter-spacing: -.018em; text-wrap: balance; overflow-wrap: break-word; }
+.v360-actions { grid-column: 1 / -1; display: flex; gap: 8px; }
+.v360-btn {
+  flex: 1; min-width: 0; height: 34px; padding: 0 14px; display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  border-radius: var(--r-sm, 3px); font-size: 12.5px; font-weight: 600; letter-spacing: .01em; white-space: nowrap;
+  transition: background .2s var(--ease, ease), color .2s var(--ease, ease), border-color .2s var(--ease, ease), transform .3s var(--spring, ease);
+}
+.v360-btn:active { transform: scale(.96); }
+.v360-btn--go { background: var(--v360-accent); color: #fff; }
+.v360-btn--go:hover { background: #6ea1ff; }
+.v360-btn--go .v360-ico { width: 14px; height: 14px; }
+.v360-btn--ghost { color: var(--txt-2, rgba(246, 248, 251, .72)); background: #ffffff12; border: 1px solid var(--line, rgba(255, 255, 255, .15)); }
+.v360-btn--ghost:hover { color: var(--txt, #f6f8fb); background: #ffffff1f; border-color: var(--line-2, rgba(255, 255, 255, .26)); }
+
+/* ---------- compact camera button (collapsed card) ---------- */
+.v360-fab {
+  position: fixed; z-index: 21; top: var(--v360-top); right: var(--gut, 22px);
+  width: 42px; height: 42px; border-radius: var(--r, 4px); display: grid; place-items: center;
+  color: var(--txt, #f6f8fb);
+  opacity: 0; visibility: hidden; pointer-events: none; transform: scale(.9);
+  transition: opacity var(--v360-fade) var(--ease, ease), transform var(--v360-fade) var(--ease, ease), background .2s var(--ease, ease), visibility 0s linear var(--v360-fade);
+}
+.v360-fab.is-on { opacity: 1; visibility: visible; pointer-events: auto; transform: none; transition: opacity var(--v360-fade) var(--ease, ease), transform .6s var(--spring, ease), background .2s var(--ease, ease), visibility 0s; }
+.v360-fab:hover { background: #1d3054a8; }
+.v360-fab .v360-ico { width: 19px; height: 19px; }
+.v360-fab:after { content: ""; position: absolute; top: 7px; right: 7px; width: 7px; height: 7px; border-radius: 50%; background: var(--v360-accent); box-shadow: 0 0 0 2px rgba(20, 37, 68, .85); }
+
+/* ---------- back button + video controls ---------- */
+.v360-back {
+  position: fixed; z-index: 30; top: var(--v360-top); right: var(--gut, 22px);
+  height: 42px; padding: 0 16px 0 12px; border-radius: var(--r, 4px);
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: InterVar, Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px; font-weight: 600; letter-spacing: -.005em; color: var(--txt, #f6f8fb);
+  opacity: 0; visibility: hidden; pointer-events: none; transform: translateY(-4px);
+  transition: opacity .4s var(--ease, ease), transform .4s var(--ease, ease), background .2s var(--ease, ease), right .52s var(--ease, ease), visibility 0s linear .4s;
+}
+.v360-back.is-on { opacity: 1; visibility: visible; pointer-events: auto; transform: none; transition: opacity .4s var(--ease, ease), transform .5s var(--spring, ease), background .2s var(--ease, ease), right .52s var(--ease, ease), visibility 0s; }
+.v360-back:hover { background: #1d3054a8; }
+.v360-back .v360-ico { width: 16px; height: 16px; }
+.v360-back .v360-esc { margin-left: 2px; padding: 2px 5px; border-radius: 2px; background: #ffffff17; color: var(--txt-2, rgba(246, 248, 251, .72)); font-size: 9.5px; letter-spacing: .06em; }
+
+/* ---------- loading spinner + error ---------- */
+.v360-loading {
+  position: fixed; z-index: 29; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 18px 22px 15px; border-radius: var(--r-lg, 5px);
+  color: var(--txt-2, rgba(246, 248, 251, .72)); text-align: center;
+  opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .3s var(--ease, ease), visibility 0s linear .3s;
+}
+.v360-loading.is-on { opacity: 1; visibility: visible; transition: opacity .3s var(--ease, ease) .12s, visibility 0s; }
+.v360-ring { width: 30px; height: 30px; border-radius: 50%; border: 2.5px solid rgba(255, 255, 255, .2); border-top-color: var(--v360-accent); animation: v360-spin .8s linear infinite; }
+@keyframes v360-spin { to { transform: rotate(360deg); } }
+
+.v360-toast {
+  position: fixed; z-index: 31; left: 50%; top: var(--v360-top); transform: translate(-50%, -6px);
+  max-width: min(420px, calc(100vw - var(--gut, 22px) * 2)); padding: 10px 16px; border-radius: var(--r, 4px);
+  font-family: InterVar, Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 13px; color: var(--txt, #f6f8fb); text-align: center;
+  opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .35s var(--ease, ease), transform .45s var(--ease, ease), visibility 0s linear .35s;
+}
+.v360-toast.is-on { opacity: 1; visibility: visible; transform: translate(-50%, 0); transition: opacity .35s var(--ease, ease), transform .45s var(--spring, ease), visibility 0s; }
+
+/* ---------- small screens: same breakpoint as the tour (860px) ---------- */
+@media (max-width: 860px) {
+  :root { --v360-top: calc(var(--gut, 14px) + 38px + 10px); }
+  /* card sits on top of the bottom bar, touch-sized */
+  .v360-card { top: auto; bottom: calc(var(--bar, 78px) + 10px + var(--v360-lift, 0px)); left: var(--gut, 14px); right: var(--gut, 14px); width: auto; transform-origin: bottom right; transform: translateY(8px) scale(.98); grid-template-columns: 96px minmax(0, 1fr); padding: 12px; }
+  .v360-card.is-on { transform: none; }
+  .v360-thumb { width: 96px; height: 64px; }
+  .v360-title { font-size: 15px; }
+  .v360-dot { margin-top: 7px; }
+  .v360-btn { height: 44px; font-size: 14px; }
+  .v360-fab { top: auto; bottom: calc(var(--bar, 78px) + 10px + var(--v360-lift, 0px)); width: 48px; height: 48px; }
+  .v360-back { height: 44px; }
+}
+
+/* phone held sideways: no room above the bar, go back under the tools like on desktop */
+@media (max-width: 860px) and (max-height: 520px) {
+  .v360-card { top: var(--v360-top); bottom: auto; left: auto; right: var(--gut, 14px); width: min(308px, calc(100vw - var(--gut, 14px) * 2)); transform-origin: top right; transform: translateY(-6px) scale(.97); }
+  .v360-card.is-on { transform: none; }
+  .v360-fab { top: var(--v360-top); bottom: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .v360-ring { animation-duration: 2.4s; }
+  .v360-stage, .v360-card, .v360-fab, .v360-back, .v360-loading, .v360-toast { transition-duration: .01ms !important; transition-delay: 0s !important; }
+}
+
+
+/* the tour's hotspot sheet (z 50) is a 452px full-height panel on the right: keep "Back to panorama" to its left.
+   On phones the sheet is a bottom sheet, so it only needs to stay above it. */
+@media (min-width: 861px) {
+  body.reading .v360-back { right: calc(min(452px, 100vw) + var(--gut, 22px)); }
+}
+@media (max-width: 860px) {
+  .v360-back { z-index: 55; }
+}
